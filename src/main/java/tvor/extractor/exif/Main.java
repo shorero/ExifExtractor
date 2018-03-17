@@ -8,6 +8,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.PrintStream;
+import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -84,23 +85,25 @@ public class Main {
 	 */
 	private void addMissingMetadata(final Map<ArgKey, String> argMap) {
 		// Get a list of the mappings, keyed by the Mayan label
-		final Map<String, ExifToMayanMapping> mayanLabelMap = ExifToMayanMapping.byMayanLabel();
+		final Map<SortKey, ExifToMayanMapping> mayanLabelMap = ExifToMayanMapping.byMayanLabel();
 
 		// Remove from the map Mayan labels that correspond to existing metadata types
 		String nextUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_METADATA_TYPES.getFunction());
 		do {
 			final MayanMetadataTypes mdts = callApiGetter(MayanMetadataTypes.class, nextUrl, argMap);
 			for (final MayanMetadataType m : mdts.getResults()) {
-				mayanLabelMap.remove(m.getLabel());
+				final SortKey k = new SortKey(m.getLabel(), 0);
+				mayanLabelMap.remove(k);
 			}
 			nextUrl = mdts.getNext();
 		} while (nextUrl != null);
 
 		// Add any remaining labels to the Mayan database
 		// Do the inserts in alphabetic order.
-		final Map<String, ExifToMayanMapping> sortedMapping = new TreeMap<>();
+		final Map<SortKey, ExifToMayanMapping> sortedMapping = new TreeMap<>();
 		for (final ExifToMayanMapping m : mayanLabelMap.values()) {
-			sortedMapping.put(m.getMayanLabel(), m);
+			final SortKey k = new SortKey(m.getMayanLabel(), 0);
+			sortedMapping.put(k, m);
 		}
 		for (final ExifToMayanMapping m : sortedMapping.values()) {
 			final NewMayanMetadataType nmt = new NewMayanMetadataType();
@@ -130,7 +133,6 @@ public class Main {
 		final ClientConfig config = new ClientConfig();
 		config.register(feature);
 		config.register(MultiPartFeature.class);
-		// config.register(ResponseFilter.class);
 		final Client client = ClientBuilder.newClient(config);
 
 		client.property("accept", doc.getLatest_version().getMimetype());
@@ -246,32 +248,48 @@ public class Main {
 			addMissingMetadata(argMap);
 		}
 
-		final Map<String, MayanMetadataType> typeByExifName = new HashMap<>();
-		String nextUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_METADATA_TYPES.getFunction());
+		final Map<SortKey, MayanMetadataType> typeByExifName = new HashMap<>();
+		String theUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_METADATA_TYPES.getFunction());
 		do {
-			final MayanMetadataTypes mdts = callApiGetter(MayanMetadataTypes.class, nextUrl, argMap);
+			final MayanMetadataTypes mdts = callApiGetter(MayanMetadataTypes.class, theUrl, argMap);
 			typeByExifName.putAll(mdts.buildExifTypes());
-			nextUrl = mdts.getNext();
-		} while (nextUrl != null);
+			theUrl = mdts.getNext();
+		} while (theUrl != null);
 
-		final Map<String, Tag> tagMap = getTagMap(argMap);
-		final Tag unprocessed = tagMap.get(argMap.get(ArgKey.MAYAN_UNPROCESSED_LABEL));
-		if (unprocessed == null) {
+		final Map<SortKey, Tag> tagMap = getTagMap(argMap);
+		final String unprocessedLabel = argMap.get(ArgKey.MAYAN_UNPROCESSED_LABEL);
+		final Set<SortKey> unprocessedSet = new HashSet<>();
+		tagMap.values().stream().forEach(t -> {
+			if (unprocessedLabel.equals(t.getLabel())) {
+				final SortKey k = new SortKey(t.getLabel(), t.getId());
+				unprocessedSet.add(k);
+			}
+		});
+		if (unprocessedSet.isEmpty()) {
 			throw new RuntimeException("No Mayan tag defined for label: " + argMap.get(ArgKey.MAYAN_UNPROCESSED_LABEL));
 		}
 
 		final Set<String> exifSkipSet = ExifToMayanMapping.getExifSkipSet();
-		final Map<String, ExifToMayanMapping> enumByExifName = ExifToMayanMapping.byExifName();
-		final Map<Integer, Set<String>> allowedMetadataMap = new HashMap<>();
-		nextUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_DOCUMENTS_FOR_TAG.getFunction(unprocessed.getId()));
-		do {
-			final TaggedDocuments docs = callApiGetter(TaggedDocuments.class, nextUrl, argMap);
-			for (final TaggedDocument d : docs.getResults()) {
-				processDocument(d, unprocessed, argMap, typeByExifName, enumByExifName, allowedMetadataMap,
-						exifSkipSet);
-			}
-			nextUrl = docs.getNext();
-		} while (nextUrl != null);
+		final Map<SortKey, ExifToMayanMapping> enumByExifName = ExifToMayanMapping.byExifName();
+		// the key here is a mayan document-type id
+		// the value is a set of sort keys indicating the EXIM metadata types allowed
+		// for that document type
+		final Map<Integer, Set<SortKey>> allowedMetadataMap = new HashMap<>();
+		unprocessedSet.stream().forEach(sk -> {
+			String nextUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_DOCUMENTS_FOR_TAG.getFunction(sk.getId()));
+			do {
+				final TaggedDocuments docs = callApiGetter(TaggedDocuments.class, nextUrl, argMap);
+				Arrays.asList(docs.getResults()).stream().forEach(d -> {
+					try {
+						processDocument(d, unprocessedSet, argMap, typeByExifName, enumByExifName, allowedMetadataMap,
+								exifSkipSet);
+					} catch (ImageProcessingException | IOException e) {
+						throw new RuntimeException(e);
+					}
+				});
+				nextUrl = docs.getNext();
+			} while (nextUrl != null);
+		});
 	}
 
 	/**
@@ -304,13 +322,14 @@ public class Main {
 	 * @return a set of the Mayan metadata-type labels already associated with the
 	 *         document
 	 */
-	private Set<String> extractExistingMetadataLabels(final TaggedDocument doc, final Map<ArgKey, String> argMap) {
+	private Set<SortKey> extractExistingMetadataLabels(final TaggedDocument doc, final Map<ArgKey, String> argMap) {
 		String nextUrl = buildUrl(argMap, RestFunction.LIST_CURRENT_MAYAN_METADATA.getFunction(doc.getId()));
-		final Set<String> rtn = new HashSet<>();
+		final Set<SortKey> rtn = new HashSet<>();
 		do {
 			final MayanCurrentMetadata cmd = callApiGetter(MayanCurrentMetadata.class, nextUrl, argMap);
 			for (final MayanCurrentMetadataValue v : cmd.getResults()) {
-				rtn.add(v.getMetadata_type().getLabel());
+				final SortKey k = new SortKey(v.getMetadata_type().getLabel(), v.getMetadata_type().getId());
+				rtn.add(k);
 			}
 			nextUrl = cmd.getNext();
 		} while (nextUrl != null);
@@ -326,14 +345,15 @@ public class Main {
 	 * @return a map of existing tags. The key of the map is the Mayan tag label.
 	 *         The value is the full data object for the tag.
 	 */
-	private Map<String, Tag> getTagMap(final Map<ArgKey, String> argMap) {
-		final Map<String, Tag> rtn = new HashMap<>();
+	private Map<SortKey, Tag> getTagMap(final Map<ArgKey, String> argMap) {
+		final Map<SortKey, Tag> rtn = new HashMap<>();
 		String nextUrl = buildUrl(argMap, RestFunction.LIST_MAYAN_TAGS.getFunction());
 		do {
 			final TagsResult r = callApiGetter(TagsResult.class, nextUrl, argMap);
 			// System.out.println("Tags result: " + r);
 			for (final Tag t : r.getResults()) {
-				rtn.put(t.getLabel(), t);
+				final SortKey k = new SortKey(t.getLabel(), t.getId());
+				rtn.put(k, t);
 			}
 			nextUrl = r.getNext();
 		} while (nextUrl != null);
@@ -447,14 +467,16 @@ public class Main {
 	 * @param doc
 	 *            the TaggedDocument instance to be processed
 	 * @param unprocessed
-	 *            the unprocessed-document tag, to be removed after processing is
+	 *            the unprocessed-document tags, to be removed after processing is
 	 *            finished
 	 * @param argMap
 	 *            the map of command-line arguments
 	 * @param byExifName
 	 *            a map using the extracted EXIF name for the key. This is the name
 	 *            appearing in an extracted image metadata value. The corresponding
-	 *            Mayan metadata instance is the value
+	 *            Mayan metadata instance is the value. Note that, since the EXIF
+	 *            name does not have an id, the id in the sort key for this map is
+	 *            always '0'.
 	 * @param enumByExifName
 	 *            a map using the extracted EXIF name for the key. This is the name
 	 *            appearing in an extracted image metadata value. The mapping enum
@@ -476,22 +498,24 @@ public class Main {
 	 * @throws IOException
 	 *             if there is an error processing an image
 	 */
-	private void processDocument(final TaggedDocument doc, final Tag unprocessed, final Map<ArgKey, String> argMap,
-			final Map<String, MayanMetadataType> byExifName, final Map<String, ExifToMayanMapping> enumByExifName,
-			final Map<Integer, Set<String>> allowedMetadataMap, final Set<String> exifSkipSet)
-			throws ImageProcessingException, IOException {
+	private void processDocument(final TaggedDocument doc, final Set<SortKey> unprocessed,
+			final Map<ArgKey, String> argMap, final Map<SortKey, MayanMetadataType> byExifName,
+			final Map<SortKey, ExifToMayanMapping> enumByExifName, final Map<Integer, Set<SortKey>> allowedMetadataMap,
+			final Set<String> exifSkipSet) throws ImageProcessingException, IOException {
 		if (doc.getLatest_version().getMimetype().startsWith("image")) {
 			if (allowedMetadataMap.get(doc.getDocument_Type().getId()) == null) {
 				updateAllowedMetadataMap(doc, allowedMetadataMap, argMap);
 			}
-			final Set<String> allowedMetadataSet = allowedMetadataMap.get(doc.getDocument_Type().getId());
+			final Set<SortKey> allowedMetadataSet = allowedMetadataMap.get(doc.getDocument_Type().getId());
 			if (allowedMetadataSet == null) {
 				throw new RuntimeException("Allowed metadata set not retrieved for " + doc.getDocument_Type().getId()
 						+ "/" + doc.getDocument_Type().getLabel());
 			}
 			processImage(doc, argMap, byExifName, allowedMetadataSet, exifSkipSet);
 		}
-		removeTag(doc, unprocessed, argMap);
+		unprocessed.stream().forEach(sk -> {
+			removeTag(doc, sk, argMap);
+		});
 	}
 
 	/**
@@ -506,7 +530,9 @@ public class Main {
 	 * @param byExifName
 	 *            a map that uses the EXIF field name as the key. This is the value
 	 *            that appears in the extracted image metadata. The value is the
-	 *            Mayan metadata type corresponding to that field name
+	 *            Mayan metadata type corresponding to that field name. Note that,
+	 *            since the EXIF type does not have an ID, the id in the
+	 *            corresponding sort key is always 0
 	 * @param allowedMetadataSet
 	 *            the set of string Mayan metadata labels, indicating the subset of
 	 *            the EXIF labels allowed for the Mayan type of the tagged document
@@ -520,15 +546,15 @@ public class Main {
 	 *             if there is an error in the image-reader for the current image
 	 */
 	private void processImage(final TaggedDocument doc, final Map<ArgKey, String> argMap,
-			final Map<String, MayanMetadataType> byExifName, final Set<String> allowedMetadataSet,
+			final Map<SortKey, MayanMetadataType> byExifName, final Set<SortKey> allowedMetadataSet,
 			final Set<String> exifSkipSet) throws ImageProcessingException, IOException {
 		if (allowedMetadataSet == null) {
 			throw new IllegalArgumentException("Null allowed-metadata set not allowed");
 		}
 		// Insert in label order, not extraction order
-		final Map<String, NewMayanMetadataValue> insertionMap = new TreeMap<>();
+		final Map<SortKey, NewMayanMetadataValue> insertionMap = new TreeMap<>();
 		// also, don't insert metadata that already exist
-		final Set<String> existingLabels = extractExistingMetadataLabels(doc, argMap);
+		final Set<SortKey> existingLabels = extractExistingMetadataLabels(doc, argMap);
 
 		final InputStream in = buildDocumentInputStream(doc, argMap);
 		final Metadata metadata = ImageMetadataReader.readMetadata(in);
@@ -547,7 +573,9 @@ public class Main {
 				if (exifSkipSet.contains(tag.getTagName())) {
 					continue;
 				}
-				final MayanMetadataType mdt = byExifName.get(tag.getTagName());
+				// ID value is always zero
+				final SortKey ex = new SortKey(tag.getTagName(), 0);
+				final MayanMetadataType mdt = byExifName.get(ex);
 				if (mdt == null) {
 					if (argMap.get(ArgKey.IGNORE_UNRECOGNIZED_EXIF).equals("true")) {
 						continue;
@@ -555,16 +583,17 @@ public class Main {
 					throw new RuntimeException("No EXIF -> Mayan mapping for EXIF tag " + tag.getTagName() + " ("
 							+ tag.getDescription() + ") in directory " + directory.getName());
 				}
-				if (existingLabels.contains(mdt.getLabel())) {
+				final SortKey sk = new SortKey(mdt.getLabel(), mdt.getId());
+				if (existingLabels.contains(sk)) {
 					continue;
 				}
-				if (allowedMetadataSet.contains(mdt.getLabel())) {
+				if (allowedMetadataSet.contains(sk)) {
 					final NewMayanMetadataValue v = new NewMayanMetadataValue();
 					v.setMetadata_type_pk(mdt.getId());
 					v.setValue(tag.getDescription());
 					v.setImageTag(tag);
 					v.setMetadataType(mdt);
-					insertionMap.put(mdt.getLabel(), v);
+					insertionMap.put(sk, v);
 				}
 			}
 		}
@@ -599,6 +628,8 @@ public class Main {
 		rtn.put(ArgKey.IGNORE_UNRECOGNIZED_EXIF, "false");
 
 		final BufferedReader in = new BufferedReader(new InputStreamReader(System.in));
+
+		System.out.println("EXIF Metadata Extractor for Mayan-EDMS");
 		System.out.println("    (-h on the command line prints help)");
 
 		System.out.print("Mayan userid (-u): ");
@@ -685,14 +716,14 @@ public class Main {
 	 *
 	 * @param doc
 	 *            the tagged document
-	 * @param unprocessed
-	 *            the tag to be removed
+	 * @param targetKey
+	 *            indicates the tag to be removed
 	 * @param argMap
 	 *            the map of command-line argument values
 	 */
-	private void removeTag(final TaggedDocument doc, final Tag unprocessed, final Map<ArgKey, String> argMap) {
+	private void removeTag(final TaggedDocument doc, final SortKey targetKey, final Map<ArgKey, String> argMap) {
 		final WebTarget target = setUpRestCall(argMap,
-				buildUrl(argMap, RestFunction.REMOVE_MAYAN_TAG.getFunction(doc.getId(), unprocessed.getId())));
+				buildUrl(argMap, RestFunction.REMOVE_MAYAN_TAG.getFunction(doc.getId(), targetKey.getId())));
 		final Invocation.Builder ib = target.request(MediaType.APPLICATION_JSON);
 		ib.delete();
 	}
@@ -751,16 +782,17 @@ public class Main {
 	 * @param argMap
 	 *            the map of command-line arguments
 	 */
-	private void updateAllowedMetadataMap(final TaggedDocument doc, final Map<Integer, Set<String>> allowedMetadataMap,
+	private void updateAllowedMetadataMap(final TaggedDocument doc, final Map<Integer, Set<SortKey>> allowedMetadataMap,
 			final Map<ArgKey, String> argMap) {
 		String nextUrl = buildUrl(argMap,
 				RestFunction.LIST_ALLOWED_MAYAN_METADATA.getFunction(doc.getDocument_Type().getId()));
-		final Set<String> typeSet = new HashSet<>();
+		final Set<SortKey> typeSet = new HashSet<>();
 		allowedMetadataMap.put(doc.getDocument_Type().getId(), typeSet);
 		do {
 			final MayanDocumentAllowedMetadata a = callApiGetter(MayanDocumentAllowedMetadata.class, nextUrl, argMap);
 			for (final MayanDocumentMetadataType t : a.getResults()) {
-				typeSet.add(t.getMetadata_type().getLabel());
+				final SortKey k = new SortKey(t.getMetadata_type().getLabel(), t.getMetadata_type().getId());
+				typeSet.add(k);
 			}
 			nextUrl = a.getNext();
 		} while (nextUrl != null);
